@@ -10,11 +10,15 @@ import (
 	"time"
 )
 
-// Conn is one configured connection with a lazily opened database handle.
+// Conn is the configured connection with a lazily opened database handle.
 type Conn struct {
 	Cfg *ConnConfig
 	mu  sync.Mutex
 	db  *DB
+}
+
+func NewConn(cfg *ConnConfig) *Conn {
+	return &Conn{Cfg: cfg}
 }
 
 // Get returns the cached handle, opening and pinging it on first use.
@@ -26,18 +30,7 @@ func (c *Conn) Get(ctx context.Context) (*DB, error) {
 	if c.db != nil {
 		return c.db, nil
 	}
-	pass := c.Cfg.Password
-	if c.Cfg.PasswordCmd != "" {
-		out, err := exec.Command("/bin/sh", "-c", c.Cfg.PasswordCmd).Output()
-		if err != nil {
-			if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
-				return nil, fmt.Errorf("password_cmd for %s: %v: %s", c.Cfg.Name, err, strings.TrimSpace(string(ee.Stderr)))
-			}
-			return nil, fmt.Errorf("password_cmd for %s: %w", c.Cfg.Name, err)
-		}
-		pass = strings.TrimRight(string(out), "\r\n")
-	}
-	dsn, err := buildDSN(c.Cfg.SQLDriver, c.Cfg.Host, c.Cfg.Port, c.Cfg.User, pass, c.Cfg.Database, c.Cfg.OracleSID)
+	dsn, err := c.resolveDSN()
 	if err != nil {
 		return nil, err
 	}
@@ -59,43 +52,45 @@ func (c *Conn) Get(ctx context.Context) (*DB, error) {
 	return c.db, nil
 }
 
-// Registry holds all configured connections in file order.
-type Registry struct {
-	conns map[string]*Conn
-	order []string
-}
-
-func NewRegistry(fc *FileConfig) *Registry {
-	r := &Registry{conns: map[string]*Conn{}}
-	for _, cc := range fc.Connections {
-		r.conns[cc.Name] = &Conn{Cfg: cc}
-		r.order = append(r.order, cc.Name)
+// resolveDSN produces the connection string: a full DSN pulled from DB_DSN_CMD
+// (e.g. macOS Keychain) or DB_DSN verbatim, otherwise assembled from the
+// discrete fields with the password possibly coming from DB_PASSWORD_CMD.
+func (c *Conn) resolveDSN() (string, error) {
+	switch {
+	case c.Cfg.DSNCmd != "":
+		return runCmd(c.Cfg.DSNCmd, "dsn_cmd for "+c.Cfg.Name)
+	case c.Cfg.DSN != "":
+		return c.Cfg.DSN, nil
 	}
-	return r
-}
-
-// Resolve maps a connection name to its Conn. An empty name is allowed only
-// when exactly one connection is configured.
-func (r *Registry) Resolve(name string) (*Conn, error) {
-	if name == "" {
-		if len(r.order) == 1 {
-			return r.conns[r.order[0]], nil
+	pass := c.Cfg.Password
+	if c.Cfg.PasswordCmd != "" {
+		p, err := runCmd(c.Cfg.PasswordCmd, "password_cmd for "+c.Cfg.Name)
+		if err != nil {
+			return "", err
 		}
-		return nil, fmt.Errorf("connection is required (available: %s)", strings.Join(r.order, ", "))
+		pass = p
 	}
-	if c, ok := r.conns[name]; ok {
-		return c, nil
-	}
-	return nil, fmt.Errorf("unknown connection %q (available: %s)", name, strings.Join(r.order, ", "))
+	return buildDSN(c.Cfg.SQLDriver, c.Cfg.Host, c.Cfg.Port, c.Cfg.User, pass, c.Cfg.Database, c.Cfg.OracleSID)
 }
 
-func (r *Registry) Close() {
-	for _, c := range r.conns {
-		c.mu.Lock()
-		if c.db != nil {
-			c.db.Close()
-			c.db = nil
+// runCmd runs a shell command and returns its trimmed stdout, used to pull a
+// secret (a password or a whole DSN) from the macOS Keychain via `security`.
+func runCmd(cmd, label string) (string, error) {
+	out, err := exec.Command("/bin/sh", "-c", cmd).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", fmt.Errorf("%s: %v: %s", label, err, strings.TrimSpace(string(ee.Stderr)))
 		}
-		c.mu.Unlock()
+		return "", fmt.Errorf("%s: %w", label, err)
 	}
+	return strings.TrimRight(string(out), "\r\n"), nil
+}
+
+func (c *Conn) Close() {
+	c.mu.Lock()
+	if c.db != nil {
+		c.db.Close()
+		c.db = nil
+	}
+	c.mu.Unlock()
 }

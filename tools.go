@@ -11,57 +11,43 @@ import (
 )
 
 type queryInput struct {
-	SQL        string `json:"sql" jsonschema:"the single SQL statement to execute"`
-	Connection string `json:"connection,omitempty" jsonschema:"connection name; optional when only one connection is configured"`
+	SQL string `json:"sql" jsonschema:"the single SQL statement to execute"`
 }
 
 type schemaInput struct {
-	Schema     string `json:"schema,omitempty" jsonschema:"optional schema or owner to filter by"`
-	Connection string `json:"connection,omitempty" jsonschema:"connection name; optional when only one connection is configured"`
+	Schema string `json:"schema,omitempty" jsonschema:"optional schema or owner to filter by"`
 }
 
 type describeInput struct {
-	Table      string `json:"table" jsonschema:"the table name to describe"`
-	Schema     string `json:"schema,omitempty" jsonschema:"optional schema or owner of the table"`
-	Connection string `json:"connection,omitempty" jsonschema:"connection name; optional when only one connection is configured"`
+	Table  string `json:"table" jsonschema:"the table name to describe"`
+	Schema string `json:"schema,omitempty" jsonschema:"optional schema or owner of the table"`
 }
 
 type searchInput struct {
-	Pattern    string `json:"pattern" jsonschema:"case-insensitive name substring to find; SQL LIKE wildcards (% and _) also work"`
-	Type       string `json:"type,omitempty" jsonschema:"restrict the search to 'table' or 'column'; omit to search both"`
-	Schema     string `json:"schema,omitempty" jsonschema:"optional schema or owner to filter by"`
-	Connection string `json:"connection,omitempty" jsonschema:"connection name; optional when only one connection is configured"`
+	Pattern string `json:"pattern" jsonschema:"case-insensitive name substring to find; SQL LIKE wildcards (% and _) also work"`
+	Type    string `json:"type,omitempty" jsonschema:"restrict the search to 'table' or 'column'; omit to search both"`
+	Schema  string `json:"schema,omitempty" jsonschema:"optional schema or owner to filter by"`
 }
 
 type explainInput struct {
-	SQL        string `json:"sql" jsonschema:"the read-only SQL statement to plan (it is not executed)"`
-	Connection string `json:"connection,omitempty" jsonschema:"connection name; optional when only one connection is configured"`
+	SQL string `json:"sql" jsonschema:"the read-only SQL statement to plan (it is not executed)"`
 }
 
-type emptyInput struct{}
-
-// connSummary describes every configured connection and its permissions, so
-// tool descriptions tell the agent what is allowed where.
-func connSummary(reg *Registry) string {
-	var parts []string
-	for _, name := range reg.order {
-		cfg := reg.conns[name].Cfg
-		target := cfg.Database
-		if target == "" {
-			target = cfg.OracleSID
-		}
-		parts = append(parts, fmt.Sprintf("%s (%s %s: %s)", name, cfg.DisplayName, target, cfg.Perms))
+// connDescription names the one database this server serves and its permitted
+// operations, appended to each tool description.
+func connDescription(cfg *ConnConfig) string {
+	target := cfg.Database
+	if target == "" {
+		target = cfg.OracleSID
 	}
-	return "Connections: " + strings.Join(parts, ", ") + "."
+	if target != "" {
+		target = " " + target
+	}
+	return fmt.Sprintf("Connection: %s%s (%s).", cfg.DisplayName, target, cfg.Perms)
 }
 
-// getDB resolves a connection name and opens its handle, mapping every
-// failure to a tool error result.
-func getDB(ctx context.Context, reg *Registry, name string) (*DB, *mcp.CallToolResult) {
-	conn, err := reg.Resolve(name)
-	if err != nil {
-		return nil, errorResult(err.Error())
-	}
+// getDB opens the connection handle, mapping failure to a tool error result.
+func getDB(ctx context.Context, conn *Conn) (*DB, *mcp.CallToolResult) {
 	db, err := conn.Get(ctx)
 	if err != nil {
 		return nil, errorResult(fmt.Sprintf("connection %q unavailable: %v", conn.Cfg.Name, err))
@@ -110,19 +96,19 @@ func runAudited(aud *Auditor, db *DB, tool, sqlText string, ops []Op, fn func() 
 	return res, err
 }
 
-// RegisterTools wires the MCP tools onto the server. All tools are always
-// registered; permissions are enforced per call because each connection has
-// its own PermSet.
-func RegisterTools(server *mcp.Server, reg *Registry, aud *Auditor) {
-	summary := connSummary(reg)
+// RegisterTools wires the MCP tools onto the server for the one connection this
+// process serves. There is no connection parameter and no way to reach any
+// other database: the project's .mcp.json defines exactly this one.
+func RegisterTools(server *mcp.Server, conn *Conn, aud *Auditor) {
+	summary := connDescription(conn.Cfg)
 
-	mcp.AddTool(server, &mcp.Tool{Name: "query", Description: "Execute a single SQL statement. Each connection has its own permitted operations. " +
+	mcp.AddTool(server, &mcp.Tool{Name: "query", Description: "Execute a single SQL statement against the configured database. " +
 		"Exactly one statement per call; DDL (CREATE/ALTER/DROP/TRUNCATE), MERGE and stored procedures are denied. " + summary},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in queryInput) (*mcp.CallToolResult, any, error) {
 			if strings.TrimSpace(in.SQL) == "" {
 				return errorResult("sql is required"), nil, nil
 			}
-			db, errRes := getDB(ctx, reg, in.Connection)
+			db, errRes := getDB(ctx, conn)
 			if errRes != nil {
 				return errRes, nil, nil
 			}
@@ -138,34 +124,9 @@ func RegisterTools(server *mcp.Server, reg *Registry, aud *Auditor) {
 			}))
 		})
 
-	mcp.AddTool(server, &mcp.Tool{Name: "list_connections", Description: "List the configured database connections, their engines and permitted operations."},
-		func(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, any, error) {
-			type connInfo struct {
-				Name        string `json:"name"`
-				Driver      string `json:"driver"`
-				Database    string `json:"database,omitempty"`
-				OracleSID   string `json:"oracle_sid,omitempty"`
-				Description string `json:"description,omitempty"`
-				Permissions string `json:"permissions"`
-			}
-			var out []connInfo
-			for _, name := range reg.order {
-				cfg := reg.conns[name].Cfg
-				out = append(out, connInfo{
-					Name: cfg.Name, Driver: cfg.DisplayName, Database: cfg.Database,
-					OracleSID: cfg.OracleSID, Description: cfg.Description, Permissions: cfg.Perms.String(),
-				})
-			}
-			b, err := json.MarshalIndent(out, "", "  ")
-			if err != nil {
-				return errorResult(err.Error()), nil, nil
-			}
-			return textResult(string(b)), nil, nil
-		})
-
-	mcp.AddTool(server, &mcp.Tool{Name: "list_tables", Description: "List base tables, optionally filtered by schema/owner. Requires read permission. " + summary},
+	mcp.AddTool(server, &mcp.Tool{Name: "list_tables", Description: "List base tables and views, optionally filtered by schema/owner. Requires read permission. " + summary},
 		func(ctx context.Context, _ *mcp.CallToolRequest, in schemaInput) (*mcp.CallToolResult, any, error) {
-			db, errRes := getDB(ctx, reg, in.Connection)
+			db, errRes := getDB(ctx, conn)
 			if errRes != nil {
 				return errRes, nil, nil
 			}
@@ -180,7 +141,7 @@ func RegisterTools(server *mcp.Server, reg *Registry, aud *Auditor) {
 			if strings.TrimSpace(in.Table) == "" {
 				return errorResult("table is required"), nil, nil
 			}
-			db, errRes := getDB(ctx, reg, in.Connection)
+			db, errRes := getDB(ctx, conn)
 			if errRes != nil {
 				return errRes, nil, nil
 			}
@@ -199,7 +160,7 @@ func RegisterTools(server *mcp.Server, reg *Registry, aud *Auditor) {
 			if in.Type != "" && in.Type != "table" && in.Type != "column" {
 				return errorResult(`type must be "table" or "column" (or omitted for both)`), nil, nil
 			}
-			db, errRes := getDB(ctx, reg, in.Connection)
+			db, errRes := getDB(ctx, conn)
 			if errRes != nil {
 				return errRes, nil, nil
 			}
@@ -218,7 +179,7 @@ func RegisterTools(server *mcp.Server, reg *Registry, aud *Auditor) {
 			if sqlText == "" {
 				return errorResult("sql is required"), nil, nil
 			}
-			db, errRes := getDB(ctx, reg, in.Connection)
+			db, errRes := getDB(ctx, conn)
 			if errRes != nil {
 				return errRes, nil, nil
 			}

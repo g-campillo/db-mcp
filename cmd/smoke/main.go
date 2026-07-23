@@ -1,12 +1,11 @@
 // Command smoke is an integration harness: it launches the db-mcp binary over
 // stdio and exercises the tools against a live database.
 //
-//	smoke [binary] [configfile] [connection]
+//	smoke [binary]
 //
-// With a configfile the child runs in config-file mode (DB_MCP_CONFIG is set
-// for it); without one it inherits the caller's DB_* env exactly as v1 did,
-// which doubles as the backward-compatibility test. A connection name, when
-// given, is passed on every tool call to exercise explicit routing.
+// The child inherits the caller's DB_* environment. Set DB_DSN (or
+// DB_DSN_CMD) to exercise the full-DSN path; otherwise use the discrete
+// DB_HOST/DB_USER/DB_NAME fields.
 //
 // Prerequisites: a widgets(id, name) table and a connection granting
 // read,create but NOT delete (the delete/drop steps assert denial).
@@ -24,23 +23,14 @@ import (
 )
 
 func main() {
-	bin, cfgFile, connName := "./db-mcp", "", ""
+	bin := "./db-mcp"
 	if len(os.Args) > 1 {
 		bin = os.Args[1]
-	}
-	if len(os.Args) > 2 {
-		cfgFile = os.Args[2]
-	}
-	if len(os.Args) > 3 {
-		connName = os.Args[3]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	cmd := exec.Command(bin)
-	if cfgFile != "" {
-		cmd.Env = append(os.Environ(), "DB_MCP_CONFIG="+cfgFile)
-	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "smoke", Version: "0.1.0"}, nil)
 	session, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
 	if err != nil {
@@ -65,7 +55,6 @@ func main() {
 		wantErr  bool   // true => we expect the permission gate to deny it
 		wantText string // non-empty => output must contain this substring
 	}{
-		{"list_connections", "list_connections", map[string]any{}, false, ""},
 		{"list_tables", "list_tables", map[string]any{}, false, ""},
 		{"describe widgets", "describe_table", map[string]any{"table": "widgets"}, false, "constraints"},
 		{"search schema", "search_schema", map[string]any{"pattern": "widg"}, false, "widgets"},
@@ -81,9 +70,6 @@ func main() {
 
 	fails := 0
 	for _, s := range steps {
-		if connName != "" && s.tool != "list_connections" {
-			s.args["connection"] = connName
-		}
 		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: s.tool, Arguments: s.args})
 		if err != nil {
 			fmt.Printf("  [TRANSPORT-ERR] %s: %v\n", s.label, err)

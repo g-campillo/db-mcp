@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,14 +33,17 @@ type auditRecord struct {
 }
 
 // NewAuditor opens (or creates) the audit log, defaulting to
-// <UserConfigDir>/db-mcp/audit.jsonl. Returns nil when auditing is disabled.
-// Open failures are for the caller to treat as fatal: a safety feature that
-// silently no-ops is worse than a crash at startup.
-func NewAuditor(fc *FileConfig) (*Auditor, error) {
-	if fc.AuditDisabled {
-		return nil, nil
+// <UserConfigDir>/db-mcp/audit.jsonl (override with DB_AUDIT_PATH). Returns nil
+// when auditing is disabled via DB_AUDIT_DISABLED. Open failures are for the
+// caller to treat as fatal: a safety feature that silently no-ops is worse than
+// a crash at startup.
+func NewAuditor() (*Auditor, error) {
+	if v := strings.TrimSpace(os.Getenv("DB_AUDIT_DISABLED")); v != "" {
+		if disabled, err := strconv.ParseBool(v); err == nil && disabled {
+			return nil, nil
+		}
 	}
-	path := fc.AuditPath
+	path := strings.TrimSpace(os.Getenv("DB_AUDIT_PATH"))
 	if path == "" {
 		dir, err := os.UserConfigDir()
 		if err != nil {

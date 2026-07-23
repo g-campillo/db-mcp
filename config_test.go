@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,98 +8,53 @@ import (
 
 func clearDBEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"DB_DRIVER", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD",
-		"DB_NAME", "DB_ORACLE_SID", "DB_PERMISSIONS", "DB_MAX_ROWS", "DB_QUERY_TIMEOUT"} {
+	for _, k := range []string{
+		"DB_DRIVER", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_PASSWORD_CMD",
+		"DB_NAME", "DB_ORACLE_SID", "DB_DSN", "DB_DSN_CMD", "DB_PERMISSIONS",
+		"DB_MAX_ROWS", "DB_QUERY_TIMEOUT", "DB_ALLOW_UNFILTERED_WRITES",
+	} {
 		t.Setenv(k, "")
 	}
 }
 
-func TestParseFileConfigValid(t *testing.T) {
-	data := []byte(`{
-		"connections": [
-			{
-				"name": "pg-prod",
-				"description": "prod postgres",
-				"driver": "postgres",
-				"host": "db.internal",
-				"user": "app_ro",
-				"password": "secret",
-				"database": "appdb",
-				"permissions": "read",
-				"query_timeout": "5s",
-				"max_cell_bytes": 100
-			},
-			{
-				"name": "ora-dev",
-				"driver": "oracle",
-				"host": "ora-host",
-				"port": 1522,
-				"user": "scott",
-				"password_cmd": "security find-generic-password -s ora-dev -w",
-				"oracle_sid": "ORCL",
-				"permissions": "read,create,update,delete",
-				"allow_unfiltered_writes": true
-			}
-		],
-		"audit_path": "/tmp/audit.jsonl"
-	}`)
+func TestLoadConfigEnvDiscrete(t *testing.T) {
+	clearDBEnv(t)
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DB_HOST", "envhost")
+	t.Setenv("DB_USER", "envuser")
+	t.Setenv("DB_PASSWORD", "trailing space ") // passwords are never trimmed
+	t.Setenv("DB_NAME", "envdb")
+	t.Setenv("DB_PERMISSIONS", "read,create")
+	t.Setenv("DB_MAX_ROWS", "42")
 
-	fc, err := parseFileConfig(data)
+	c, err := LoadConfig()
 	if err != nil {
-		t.Fatalf("parseFileConfig: %v", err)
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	if fc.AuditPath != "/tmp/audit.jsonl" {
-		t.Errorf("AuditPath = %q, want /tmp/audit.jsonl", fc.AuditPath)
+	if c.Name != "default" {
+		t.Errorf("name = %q, want default", c.Name)
 	}
-	if len(fc.Connections) != 2 {
-		t.Fatalf("got %d connections, want 2", len(fc.Connections))
+	if c.SQLDriver != "pgx" || c.DisplayName != "postgres" || c.Host != "envhost" || c.Port != 5432 {
+		t.Errorf("resolved (%s, %s, %s, %d)", c.SQLDriver, c.DisplayName, c.Host, c.Port)
 	}
-
-	pg := fc.Connections[0]
-	if pg.SQLDriver != "pgx" || pg.DisplayName != "postgres" {
-		t.Errorf("pg driver resolved to (%q, %q), want (pgx, postgres)", pg.SQLDriver, pg.DisplayName)
+	if c.Password != "trailing space " {
+		t.Errorf("password was trimmed: %q", c.Password)
 	}
-	if pg.Port != 5432 {
-		t.Errorf("pg.Port = %d, want default 5432", pg.Port)
+	if !c.Perms[OpRead] || !c.Perms[OpCreate] || c.Perms[OpDelete] {
+		t.Errorf("perms = %v, want read,create", c.Perms)
 	}
-	if pg.MaxRows != 500 {
-		t.Errorf("pg.MaxRows = %d, want default 500", pg.MaxRows)
+	if c.MaxRows != 42 {
+		t.Errorf("MaxRows = %d, want 42", c.MaxRows)
 	}
-	if pg.Timeout != 5*time.Second {
-		t.Errorf("pg.Timeout = %v, want 5s", pg.Timeout)
+	if c.Timeout != 30*time.Second {
+		t.Errorf("Timeout = %v, want default 30s", c.Timeout)
 	}
-	if !pg.Perms[OpRead] || pg.Perms[OpDelete] {
-		t.Errorf("pg.Perms = %v, want read only", pg.Perms)
-	}
-	if pg.MaxCellBytes != 100 {
-		t.Errorf("pg.MaxCellBytes = %d, want 100 (explicit)", pg.MaxCellBytes)
-	}
-
-	ora := fc.Connections[1]
-	if ora.SQLDriver != "oracle" {
-		t.Errorf("ora.SQLDriver = %q, want oracle", ora.SQLDriver)
-	}
-	if ora.Port != 1522 {
-		t.Errorf("ora.Port = %d, want explicit 1522", ora.Port)
-	}
-	if ora.Timeout != 30*time.Second {
-		t.Errorf("ora.Timeout = %v, want default 30s", ora.Timeout)
-	}
-	if !ora.Perms[OpRead] || !ora.Perms[OpCreate] || !ora.Perms[OpUpdate] || !ora.Perms[OpDelete] {
-		t.Errorf("ora.Perms = %v, want full crud", ora.Perms)
-	}
-	if ora.PasswordCmd == "" {
-		t.Error("ora.PasswordCmd lost in parsing")
-	}
-	if !ora.AllowUnfilteredWrites {
-		t.Error("ora.AllowUnfilteredWrites = false, want true")
-	}
-	if ora.MaxCellBytes != 8192 {
-		t.Errorf("ora.MaxCellBytes = %d, want default 8192", ora.MaxCellBytes)
+	if c.MaxCellBytes != 8192 {
+		t.Errorf("MaxCellBytes = %d, want default 8192", c.MaxCellBytes)
 	}
 }
 
-func TestParseFileConfigDriverAliases(t *testing.T) {
+func TestLoadConfigDriverAliases(t *testing.T) {
 	cases := []struct {
 		alias, sqlDriver string
 		defPort          int
@@ -113,141 +66,132 @@ func TestParseFileConfigDriverAliases(t *testing.T) {
 		{"oracle", "oracle", 1521},
 	}
 	for _, c := range cases {
-		db, sid := `"database": "d"`, ``
-		if c.alias == "oracle" {
-			db, sid = ``, `"oracle_sid": "X",`
-		}
-		j := `{"connections":[{"name":"c1","driver":"` + c.alias + `","host":"h","user":"u",` + sid + db
-		j = strings.TrimRight(j, ",") + `}]}`
-		fc, err := parseFileConfig([]byte(j))
-		if err != nil {
-			t.Errorf("%s: %v", c.alias, err)
-			continue
-		}
-		got := fc.Connections[0]
-		if got.SQLDriver != c.sqlDriver || got.Port != c.defPort {
-			t.Errorf("%s resolved to (%s, %d), want (%s, %d)", c.alias, got.SQLDriver, got.Port, c.sqlDriver, c.defPort)
-		}
+		t.Run(c.alias, func(t *testing.T) {
+			clearDBEnv(t)
+			t.Setenv("DB_DRIVER", c.alias)
+			t.Setenv("DB_HOST", "h")
+			t.Setenv("DB_USER", "u")
+			if c.alias == "oracle" {
+				t.Setenv("DB_ORACLE_SID", "X")
+			} else {
+				t.Setenv("DB_NAME", "d")
+			}
+			got, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("%s: %v", c.alias, err)
+			}
+			if got.SQLDriver != c.sqlDriver || got.Port != c.defPort {
+				t.Errorf("%s resolved to (%s, %d), want (%s, %d)", c.alias, got.SQLDriver, got.Port, c.sqlDriver, c.defPort)
+			}
+		})
 	}
 }
 
-func TestLoadConfigFileWinsOverEnv(t *testing.T) {
-	clearDBEnv(t)
-	t.Setenv("DB_DRIVER", "postgres") // legacy env present but must lose to the file
-	t.Setenv("DB_HOST", "envhost")
-	t.Setenv("DB_USER", "envuser")
-	t.Setenv("DB_NAME", "envdb")
-
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"connections":[
-		{"name":"filecon","driver":"sqlserver","host":"h","user":"u","database":"d"}]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fc, err := loadConfig(path, "")
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if len(fc.Connections) != 1 || fc.Connections[0].Name != "filecon" {
-		t.Errorf("expected file connection to win, got %+v", fc.Connections)
-	}
-}
-
-func TestLoadConfigExplicitPathMissing(t *testing.T) {
-	clearDBEnv(t)
-	t.Setenv("DB_DRIVER", "postgres") // even with legacy env, an explicit path must not silently fall back
-	_, err := loadConfig(filepath.Join(t.TempDir(), "nope.json"), "")
-	if err == nil || !strings.Contains(err.Error(), "nope.json") {
-		t.Errorf("expected read error naming the file, got %v", err)
-	}
-}
-
-func TestLoadConfigLegacyEnvFallback(t *testing.T) {
+func TestLoadConfigDSNMode(t *testing.T) {
 	clearDBEnv(t)
 	t.Setenv("DB_DRIVER", "postgres")
-	t.Setenv("DB_HOST", "envhost")
-	t.Setenv("DB_USER", "envuser")
-	t.Setenv("DB_PASSWORD", "trailing space ") // passwords are never trimmed
-	t.Setenv("DB_NAME", "envdb")
-	t.Setenv("DB_PERMISSIONS", "read,create")
-	t.Setenv("DB_MAX_ROWS", "42")
+	t.Setenv("DB_DSN", "postgres://u:p@h:5432/d") // no discrete host/user/database needed
+	t.Setenv("DB_PERMISSIONS", "read")
 
-	fc, err := loadConfig("", filepath.Join(t.TempDir(), "absent.json"))
+	c, err := LoadConfig()
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	if len(fc.Connections) != 1 {
-		t.Fatalf("got %d connections, want 1", len(fc.Connections))
+	if c.DSN != "postgres://u:p@h:5432/d" {
+		t.Errorf("DSN = %q, not preserved", c.DSN)
 	}
-	c := fc.Connections[0]
-	if c.Name != "default" {
-		t.Errorf("legacy connection name = %q, want default", c.Name)
+	if c.SQLDriver != "pgx" {
+		t.Errorf("SQLDriver = %q, want pgx", c.SQLDriver)
 	}
-	if c.SQLDriver != "pgx" || c.Host != "envhost" || c.Port != 5432 {
-		t.Errorf("legacy resolve got (%s, %s, %d)", c.SQLDriver, c.Host, c.Port)
-	}
-	if c.Password != "trailing space " {
-		t.Errorf("password was trimmed: %q", c.Password)
-	}
-	if !c.Perms[OpRead] || !c.Perms[OpCreate] || c.Perms[OpDelete] {
-		t.Errorf("legacy perms = %v", c.Perms)
-	}
-	if c.MaxRows != 42 {
-		t.Errorf("legacy MaxRows = %d, want 42", c.MaxRows)
+	if c.Host != "" {
+		t.Errorf("Host = %q, want empty in DSN mode", c.Host)
 	}
 }
 
-func TestLoadConfigLegacyBadPort(t *testing.T) {
+func TestLoadConfigDSNCmdMode(t *testing.T) {
 	clearDBEnv(t)
 	t.Setenv("DB_DRIVER", "oracle")
-	t.Setenv("DB_HOST", "h")
-	t.Setenv("DB_USER", "u")
-	t.Setenv("DB_ORACLE_SID", "X")
-	t.Setenv("DB_PORT", "nan")
-	_, err := loadConfig("", filepath.Join(t.TempDir(), "absent.json"))
-	if err == nil || !strings.Contains(err.Error(), "DB_PORT") {
-		t.Errorf("expected DB_PORT error, got %v", err)
+	// The command is NOT run at config-load time (only lazily on first Get),
+	// so an arbitrary command still resolves the config cleanly.
+	t.Setenv("DB_DSN_CMD", "security find-generic-password -s db-mcp/ora -w")
+	t.Setenv("DB_PERMISSIONS", "read,create,update,delete")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.DSNCmd == "" {
+		t.Error("DSNCmd lost in parsing")
+	}
+	if !c.Perms[OpDelete] {
+		t.Errorf("perms = %v, want full crud", c.Perms)
 	}
 }
 
-func TestLoadConfigNothingConfigured(t *testing.T) {
+func TestLoadConfigAllowUnfilteredWrites(t *testing.T) {
 	clearDBEnv(t)
-	_, err := loadConfig("", filepath.Join(t.TempDir(), "absent.json"))
-	if err == nil || !strings.Contains(err.Error(), "DB_MCP_CONFIG") {
-		t.Errorf("expected guidance naming DB_MCP_CONFIG, got %v", err)
+	t.Setenv("DB_DRIVER", "postgres")
+	t.Setenv("DB_DSN", "postgres://u:p@h:5432/d")
+	t.Setenv("DB_ALLOW_UNFILTERED_WRITES", "true")
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !c.AllowUnfilteredWrites {
+		t.Error("AllowUnfilteredWrites = false, want true")
 	}
 }
 
-func TestParseFileConfigErrors(t *testing.T) {
+func TestLoadConfigErrors(t *testing.T) {
 	cases := []struct {
 		label   string
-		json    string
+		env     map[string]string
 		wantErr string
 	}{
-		{"invalid json", `{`, "parse"},
-		{"no connections", `{"connections":[]}`, "at least one connection"},
-		{"missing name", `{"connections":[{"driver":"postgres","host":"h","user":"u","database":"d"}]}`, "name"},
-		{"dup names", `{"connections":[
-			{"name":"a","driver":"postgres","host":"h","user":"u","database":"d"},
-			{"name":"a","driver":"postgres","host":"h","user":"u","database":"d"}]}`, "duplicate"},
-		{"bad driver", `{"connections":[{"name":"a","driver":"mysql","host":"h","user":"u","database":"d"}]}`, "driver"},
-		{"missing host", `{"connections":[{"name":"a","driver":"postgres","user":"u","database":"d"}]}`, "host"},
-		{"missing user", `{"connections":[{"name":"a","driver":"postgres","host":"h","database":"d"}]}`, "user"},
-		{"pg missing database", `{"connections":[{"name":"a","driver":"postgres","host":"h","user":"u"}]}`, "database"},
-		{"oracle no db no sid", `{"connections":[{"name":"a","driver":"oracle","host":"h","user":"u"}]}`, "oracle"},
-		{"oracle both db and sid", `{"connections":[{"name":"a","driver":"oracle","host":"h","user":"u","database":"d","oracle_sid":"s"}]}`, "one of"},
-		{"password and password_cmd", `{"connections":[{"name":"a","driver":"postgres","host":"h","user":"u","database":"d","password":"p","password_cmd":"c"}]}`, "password_cmd"},
-		{"bad timeout", `{"connections":[{"name":"a","driver":"postgres","host":"h","user":"u","database":"d","query_timeout":"nope"}]}`, "query_timeout"},
-		{"negative max_rows", `{"connections":[{"name":"a","driver":"postgres","host":"h","user":"u","database":"d","max_rows":-2}]}`, "max_rows"},
-		{"bad permissions", `{"connections":[{"name":"a","driver":"postgres","host":"h","user":"u","database":"d","permissions":"read,admin"}]}`, "permission"},
+		{"missing driver", map[string]string{}, "db_driver"},
+		{"bad driver", map[string]string{"DB_DRIVER": "mysql", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d"}, "driver"},
+		{"discrete missing host", map[string]string{"DB_DRIVER": "postgres", "DB_USER": "u", "DB_NAME": "d"}, "host"},
+		{"discrete missing user", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_NAME": "d"}, "user"},
+		{"pg missing database", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u"}, "database"},
+		{"oracle no db no sid", map[string]string{"DB_DRIVER": "oracle", "DB_HOST": "h", "DB_USER": "u"}, "oracle"},
+		{"oracle both db and sid", map[string]string{"DB_DRIVER": "oracle", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "svc", "DB_ORACLE_SID": "X"}, "one of"},
+		{"dsn plus password", map[string]string{"DB_DRIVER": "postgres", "DB_DSN": "postgres://u:p@h/d", "DB_PASSWORD": "p"}, "db_password"},
+		{"dsn plus dsn_cmd", map[string]string{"DB_DRIVER": "postgres", "DB_DSN": "postgres://u:p@h/d", "DB_DSN_CMD": "echo x"}, "mutually exclusive"},
+		{"password plus password_cmd", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d", "DB_PASSWORD": "p", "DB_PASSWORD_CMD": "c"}, "mutually exclusive"},
+		{"bad port", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d", "DB_PORT": "nan"}, "db_port"},
+		{"bad max_rows", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d", "DB_MAX_ROWS": "-2"}, "db_max_rows"},
+		{"bad permissions", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d", "DB_PERMISSIONS": "read,admin"}, "permission"},
+		{"bad timeout", map[string]string{"DB_DRIVER": "postgres", "DB_HOST": "h", "DB_USER": "u", "DB_NAME": "d", "DB_QUERY_TIMEOUT": "nope"}, "query_timeout"},
+		{"bad allow_unfiltered_writes", map[string]string{"DB_DRIVER": "postgres", "DB_DSN": "postgres://u:p@h/d", "DB_ALLOW_UNFILTERED_WRITES": "maybe"}, "db_allow_unfiltered_writes"},
 	}
 	for _, c := range cases {
-		_, err := parseFileConfig([]byte(c.json))
-		if err == nil {
-			t.Errorf("%s: expected error, got nil", c.label)
-			continue
-		}
-		if !strings.Contains(strings.ToLower(err.Error()), c.wantErr) {
-			t.Errorf("%s: error %q does not mention %q", c.label, err, c.wantErr)
-		}
+		t.Run(c.label, func(t *testing.T) {
+			clearDBEnv(t)
+			for k, v := range c.env {
+				t.Setenv(k, v)
+			}
+			_, err := LoadConfig()
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), c.wantErr) {
+				t.Errorf("error %q does not mention %q", err, c.wantErr)
+			}
+		})
+	}
+}
+
+func TestBuildDSN(t *testing.T) {
+	pg, err := buildDSN("pgx", "h", 5432, "u", "p", "d", "")
+	if err != nil || pg != "postgres://u:p@h:5432/d" {
+		t.Errorf("pg DSN = %q, %v", pg, err)
+	}
+	ms, err := buildDSN("sqlserver", "h", 1433, "u", "p", "d", "")
+	if err != nil || !strings.Contains(ms, "sqlserver://u:p@h:1433?database=d") {
+		t.Errorf("mssql DSN = %q, %v", ms, err)
+	}
+	ora, err := buildDSN("oracle", "h", 1521, "u", "p", "svc", "")
+	if err != nil || !strings.HasPrefix(ora, "oracle://") {
+		t.Errorf("oracle DSN = %q, %v", ora, err)
 	}
 }

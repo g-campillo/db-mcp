@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/url"
@@ -15,76 +13,54 @@ import (
 	go_ora "github.com/sijms/go-ora/v2"
 )
 
-// FileConfig is the multi-connection configuration loaded from a JSON file.
-type FileConfig struct {
-	Connections   []*ConnConfig `json:"connections"`
-	AuditPath     string        `json:"audit_path"`
-	AuditDisabled bool          `json:"audit_disabled"`
-}
-
-// ConnConfig is one named database connection: the JSON fields plus the
-// resolved (non-serialised) driver, permissions and timeout.
+// ConnConfig is the single database connection this process serves. Its fields
+// come from the DB_* environment variables set in the project's local
+// .mcp.json; the SQL driver name, parsed permissions and timeout are resolved.
 type ConnConfig struct {
-	Name                  string `json:"name"`
-	Description           string `json:"description"`
-	Driver                string `json:"driver"`
-	Host                  string `json:"host"`
-	Port                  int    `json:"port"`
-	User                  string `json:"user"`
-	Password              string `json:"password"`
-	PasswordCmd           string `json:"password_cmd"`
-	Database              string `json:"database"`
-	OracleSID             string `json:"oracle_sid"`
-	Permissions           string `json:"permissions"`
-	MaxRows               int    `json:"max_rows"`
-	QueryTimeout          string `json:"query_timeout"`
-	AllowUnfilteredWrites bool   `json:"allow_unfiltered_writes"`
-	MaxCellBytes          int    `json:"max_cell_bytes"`
-	MaxResultBytes        int    `json:"max_result_bytes"`
+	Name                  string
+	Driver                string
+	Host                  string
+	Port                  int
+	User                  string
+	Password              string
+	PasswordCmd           string
+	Database              string
+	OracleSID             string
+	DSN                   string // full driver-native connection string (bypasses buildDSN)
+	DSNCmd                string // command whose stdout is the full DSN (e.g. macOS Keychain)
+	Permissions           string
+	MaxRows               int
+	QueryTimeout          string
+	AllowUnfilteredWrites bool
+	MaxCellBytes          int
+	MaxResultBytes        int
 
-	SQLDriver   string        `json:"-"` // database/sql driver name: pgx | sqlserver | oracle
-	DisplayName string        `json:"-"` // user-facing driver label
-	Perms       PermSet       `json:"-"`
-	Timeout     time.Duration `json:"-"`
+	SQLDriver   string        // database/sql driver name: pgx | sqlserver | oracle
+	DisplayName string        // user-facing driver label
+	Perms       PermSet       //
+	Timeout     time.Duration //
 }
 
-// loadConfig picks the configuration source: an explicit DB_MCP_CONFIG path
-// (must exist), else the default config file if present, else legacy DB_* env.
-func loadConfig(explicitPath, defaultPath string) (*FileConfig, error) {
-	path := explicitPath
-	if path == "" {
-		path = defaultPath
-	}
-	if path != "" {
-		data, err := os.ReadFile(path)
-		switch {
-		case err == nil:
-			warnLoosePerms(path)
-			return parseFileConfig(data)
-		case explicitPath != "":
-			return nil, fmt.Errorf("read config %s: %w", path, err)
-		case !os.IsNotExist(err):
-			return nil, fmt.Errorf("read config %s: %w", path, err)
-		}
-	}
-	if strings.TrimSpace(os.Getenv("DB_DRIVER")) != "" {
-		return legacyConfig()
-	}
-	return nil, fmt.Errorf("no configuration found: create %s or point DB_MCP_CONFIG at a config file (legacy DB_* env vars also still work)", path)
-}
-
-// legacyConfig synthesises a single connection named "default" from the v1
-// DB_* environment variables, for backward compatibility.
-func legacyConfig() (*FileConfig, error) {
+// LoadConfig builds the one connection this process serves from the DB_*
+// environment variables in the project's local .mcp.json. There is no
+// machine-global config file: a project reaches exactly the database its own
+// .mcp.json names, and nothing else.
+func LoadConfig() (*ConnConfig, error) {
 	env := func(k string) string { return strings.TrimSpace(os.Getenv(k)) }
+	if env("DB_DRIVER") == "" {
+		return nil, fmt.Errorf("no database configured: set DB_DRIVER plus either DB_DSN_CMD (a command yielding the full connection string) or DB_HOST/DB_USER/DB_NAME in this project's .mcp.json env")
+	}
 	c := &ConnConfig{
 		Name:         "default",
 		Driver:       env("DB_DRIVER"),
 		Host:         env("DB_HOST"),
 		User:         env("DB_USER"),
 		Password:     os.Getenv("DB_PASSWORD"), // never trim a password
+		PasswordCmd:  env("DB_PASSWORD_CMD"),
 		Database:     env("DB_NAME"),
 		OracleSID:    env("DB_ORACLE_SID"),
+		DSN:          env("DB_DSN"),
+		DSNCmd:       env("DB_DSN_CMD"),
 		Permissions:  os.Getenv("DB_PERMISSIONS"),
 		QueryTimeout: env("DB_QUERY_TIMEOUT"),
 	}
@@ -102,92 +78,71 @@ func legacyConfig() (*FileConfig, error) {
 		}
 		c.MaxRows = n
 	}
+	if v := env("DB_ALLOW_UNFILTERED_WRITES"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid DB_ALLOW_UNFILTERED_WRITES %q (use true/false)", v)
+		}
+		c.AllowUnfilteredWrites = b
+	}
 	if err := resolveConn(c); err != nil {
 		return nil, err
 	}
-	return &FileConfig{Connections: []*ConnConfig{c}}, nil
+	return c, nil
 }
 
-// warnLoosePerms nags on stderr when a config file that may hold passwords is
-// readable by group or other.
-func warnLoosePerms(path string) {
-	if fi, err := os.Stat(path); err == nil && fi.Mode().Perm()&0o044 != 0 {
-		log.Printf("warning: config file %s is readable by group/other (mode %03o); consider chmod 600", path, fi.Mode().Perm())
-	}
-}
-
-// parseFileConfig parses and validates the JSON config file contents.
-func parseFileConfig(data []byte) (*FileConfig, error) {
-	var fc FileConfig
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&fc); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	if len(fc.Connections) == 0 {
-		return nil, fmt.Errorf("config must define at least one connection")
-	}
-	seen := map[string]bool{}
-	for i, c := range fc.Connections {
-		if err := resolveConn(c); err != nil {
-			label := c.Name
-			if label == "" {
-				label = fmt.Sprintf("#%d", i+1)
-			}
-			return nil, fmt.Errorf("connection %s: %w", label, err)
-		}
-		if seen[c.Name] {
-			return nil, fmt.Errorf("duplicate connection name %q", c.Name)
-		}
-		seen[c.Name] = true
-	}
-	return &fc, nil
-}
-
-// resolveConn validates one connection entry and fills in the resolved fields
-// (SQL driver name, defaults, parsed permissions and timeout).
+// resolveConn validates the connection and fills in the resolved fields (SQL
+// driver name, defaults, parsed permissions and timeout). In DSN mode the full
+// connection string carries host/user/credentials, so those discrete fields are
+// not required.
 func resolveConn(c *ConnConfig) error {
 	if c.Name = strings.TrimSpace(c.Name); c.Name == "" {
-		return fmt.Errorf("name is required")
+		c.Name = "default"
 	}
-	var defPort int
-	switch strings.ToLower(strings.TrimSpace(c.Driver)) {
-	case "postgres", "postgresql":
-		defPort, c.SQLDriver, c.DisplayName = 5432, "pgx", "postgres"
-	case "sqlserver", "mssql":
-		defPort, c.SQLDriver, c.DisplayName = 1433, "sqlserver", "sqlserver"
-	case "oracle":
-		defPort, c.SQLDriver, c.DisplayName = 1521, "oracle", "oracle"
-	default:
+	sqlDriver, displayName, defPort, ok := resolveDriver(c.Driver)
+	if !ok {
 		return fmt.Errorf("unsupported driver %q (use postgres, sqlserver or oracle)", c.Driver)
 	}
-	if c.Host = strings.TrimSpace(c.Host); c.Host == "" {
-		return fmt.Errorf("host is required")
-	}
-	if c.User = strings.TrimSpace(c.User); c.User == "" {
-		return fmt.Errorf("user is required")
-	}
-	if c.Port < 0 {
-		return fmt.Errorf("invalid port %d", c.Port)
-	}
-	if c.Port == 0 {
-		c.Port = defPort
-	}
-	if c.Password != "" && c.PasswordCmd != "" {
-		return fmt.Errorf("password and password_cmd are mutually exclusive")
-	}
-	switch c.SQLDriver {
-	case "pgx", "sqlserver":
-		if strings.TrimSpace(c.Database) == "" {
-			return fmt.Errorf("database is required for %s", c.DisplayName)
+	c.SQLDriver, c.DisplayName = sqlDriver, displayName
+
+	if c.DSN != "" || c.DSNCmd != "" {
+		if c.DSN != "" && c.DSNCmd != "" {
+			return fmt.Errorf("DB_DSN and DB_DSN_CMD are mutually exclusive")
 		}
-	case "oracle":
-		hasDB := strings.TrimSpace(c.Database) != ""
-		hasSID := strings.TrimSpace(c.OracleSID) != ""
-		if hasDB == hasSID {
-			return fmt.Errorf("oracle requires exactly one of database (service name) or oracle_sid")
+		if c.Password != "" || c.PasswordCmd != "" {
+			return fmt.Errorf("DB_DSN/DB_DSN_CMD carry the credentials, so cannot be combined with DB_PASSWORD/DB_PASSWORD_CMD")
+		}
+		_ = defPort // DSN mode ignores discrete host/port fields
+	} else {
+		if c.Host = strings.TrimSpace(c.Host); c.Host == "" {
+			return fmt.Errorf("host is required (set DB_HOST, or use DB_DSN_CMD)")
+		}
+		if c.User = strings.TrimSpace(c.User); c.User == "" {
+			return fmt.Errorf("user is required (set DB_USER, or use DB_DSN_CMD)")
+		}
+		if c.Port < 0 {
+			return fmt.Errorf("invalid port %d", c.Port)
+		}
+		if c.Port == 0 {
+			c.Port = defPort
+		}
+		if c.Password != "" && c.PasswordCmd != "" {
+			return fmt.Errorf("DB_PASSWORD and DB_PASSWORD_CMD are mutually exclusive")
+		}
+		switch c.SQLDriver {
+		case "pgx", "sqlserver":
+			if strings.TrimSpace(c.Database) == "" {
+				return fmt.Errorf("database is required for %s (set DB_NAME)", c.DisplayName)
+			}
+		case "oracle":
+			hasDB := strings.TrimSpace(c.Database) != ""
+			hasSID := strings.TrimSpace(c.OracleSID) != ""
+			if hasDB == hasSID {
+				return fmt.Errorf("oracle requires exactly one of DB_NAME (service name) or DB_ORACLE_SID")
+			}
 		}
 	}
+
 	perms, err := ParsePerms(c.Permissions)
 	if err != nil {
 		return err
@@ -213,21 +168,37 @@ func resolveConn(c *ConnConfig) error {
 	return nil
 }
 
-// LoadConfig resolves configuration from DB_MCP_CONFIG, the default config
-// file, or legacy DB_* environment variables.
-func LoadConfig() (*FileConfig, error) {
-	return loadConfig(strings.TrimSpace(os.Getenv("DB_MCP_CONFIG")), defaultConfigPath())
-}
-
-func defaultConfigPath() string {
+// warnStaleGlobalConfig nags once on stderr if the retired v2 machine-global
+// config file is still on disk. It is no longer read: that ambient file let any
+// project reach every connection listed in it. Credentials now live per-project
+// in .mcp.json env plus the macOS Keychain.
+func warnStaleGlobalConfig() {
 	dir, err := os.UserConfigDir()
 	if err != nil {
-		return ""
+		return
 	}
-	return filepath.Join(dir, "db-mcp", "config.json")
+	path := filepath.Join(dir, "db-mcp", "config.json")
+	if _, err := os.Stat(path); err == nil {
+		log.Printf("warning: %s is no longer read; move each project's connection into its .mcp.json env (DB_DRIVER + DB_PERMISSIONS + DB_DSN_CMD) and delete this file", path)
+	}
+}
+
+// resolveDriver maps a user-facing driver name/alias to the database/sql driver
+// name, display label and default port. ok is false for an unknown driver.
+func resolveDriver(driver string) (sqlDriver, displayName string, defPort int, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "postgres", "postgresql":
+		return "pgx", "postgres", 5432, true
+	case "sqlserver", "mssql":
+		return "sqlserver", "sqlserver", 1433, true
+	case "oracle":
+		return "oracle", "oracle", 1521, true
+	}
+	return "", "", 0, false
 }
 
 // buildDSN assembles a driver-native connection string from discrete fields.
+// Used only when DB_DSN/DB_DSN_CMD are not set.
 func buildDSN(sqlDriver, host string, port int, user, pass, name, sid string) (string, error) {
 	hostport := fmt.Sprintf("%s:%d", host, port)
 	switch sqlDriver {
