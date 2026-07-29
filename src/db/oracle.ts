@@ -16,6 +16,10 @@ oracledb.fetchAsString = [oracledb.CLOB];
  * Instant Client, matching the Go build's use of a pure-Go driver. Connections
  * are made by host + port with a service name or SID; wallets and TNS aliases
  * are not supported, as before.
+ *
+ * Thin mode reaches Oracle Database 12.1 and later. The version is rarely the
+ * problem in practice — the account's password verifier is (see
+ * `oracleConnectHint`).
  */
 export class OracleAdapter implements DbAdapter {
   private constructor(
@@ -25,15 +29,19 @@ export class OracleAdapter implements DbAdapter {
 
   static async open(cfg: ResolvedConfig, dsn: string): Promise<OracleAdapter> {
     const parts = parseDsn("oracle", dsn);
-    const pool = await oracledb.createPool({
-      user: parts.user,
-      password: parts.password,
-      connectString: oracleConnectString(parts),
-      poolMin: 0,
-      poolMax: 5,
-      poolTimeout: 300,
-    });
-    return new OracleAdapter(cfg, pool);
+    try {
+      const pool = await oracledb.createPool({
+        user: parts.user,
+        password: parts.password,
+        connectString: oracleConnectString(parts),
+        poolMin: 0,
+        poolMax: 5,
+        poolTimeout: 300,
+      });
+      return new OracleAdapter(cfg, pool);
+    } catch (err) {
+      throw oracleConnectHint(err);
+    }
   }
 
   /** Borrows a connection with the query timeout applied. */
@@ -183,6 +191,33 @@ function rethrow(label: string): (err: unknown) => never {
   return (err: unknown) => {
     throw new Error(`${label}: ${errorMessage(err)}`);
   };
+}
+
+/**
+ * Explains the two Thin-mode connection failures that look like a bad password
+ * but are not.
+ *
+ * An account whose only password verifier is the legacy 10G one cannot be
+ * authenticated in Thin mode at all — common on long-lived Oracle estates where
+ * the account predates 11g, regardless of how new the *server* is. Thick mode
+ * accepts it, which is why the same credentials may work in SQL*Plus.
+ */
+function oracleConnectHint(err: unknown): Error {
+  const e = err instanceof Error ? err : new Error(String(err));
+  if (e.message.includes("NJS-116")) {
+    return new Error(
+      `${e.message} (this account has only the legacy 10G password verifier, which Thin mode cannot use; ` +
+        `a DBA can refresh it by resetting the password with SQLNET.ALLOWED_LOGON_VERSION_SERVER at 11 or lower — ` +
+        `check with: SELECT username, password_versions FROM dba_users WHERE username = '<USER>')`,
+    );
+  }
+  if (e.message.includes("ORA-28040")) {
+    return new Error(
+      `${e.message} (the server rejected the authentication protocol; this usually means the account's password ` +
+        `verifier and the server's SQLNET.ALLOWED_LOGON_VERSION_SERVER setting do not overlap with what Thin mode offers)`,
+    );
+  }
+  return e;
 }
 
 function oracleExplainHint(err: unknown): Error {

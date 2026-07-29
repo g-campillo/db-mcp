@@ -22,6 +22,55 @@ parameter and no `list_connections` tool, so an agent is confined to the one
 database its project granted it. Store the secret in the macOS Keychain, not on
 disk.
 
+## Supported database versions
+
+| Engine | Supported | Verified against |
+|--------|-----------|------------------|
+| PostgreSQL | 9.5+ | **14**, 16 |
+| SQL Server | 2012+ (TDS 7.4) | **2019**, 2022 |
+| Oracle | 12.1+ | **18c XE**, 21c XE, 23 Free |
+
+The floors come from the drivers themselves: `tedious` speaks TDS 7.4 (SQL
+Server 2012 onward) and node-oracledb's Thin mode reaches Oracle Database 12.1
+and later. Every version in the "verified" column ran the full smoke suite —
+all five tools plus every permission denial — with no behavioural difference
+between them. Oracle 19c sits inside the tested range on both sides.
+
+Nothing in the catalog queries is version-specific: they use
+`information_schema` / `sys.*` / `all_*` views that have been stable for well
+over a decade.
+
+### The one real version trap (Oracle)
+
+It is not the server version — it is the **account's password verifier**. Thin
+mode requires an 11G or newer verifier. An account carrying only the legacy 10G
+verifier fails with `NJS-116` no matter how new the database is, which is easy
+to hit on a long-lived Oracle 19 estate. SQL*Plus still works on such an
+account, so it looks like db-mcp has the password wrong.
+
+db-mcp turns that error into an explanation, including the query to confirm it:
+
+```sql
+SELECT username, password_versions FROM dba_users WHERE username = '<USER>';
+```
+
+If the answer is `10G` alone, a DBA resetting the account's password (with
+`SQLNET.ALLOWED_LOGON_VERSION_SERVER` at 11 or lower) regenerates a usable
+verifier.
+
+### SQL Server encryption
+
+Encryption is off by default, matching the Go driver. If your server requires
+it, add `encrypt=true` to the DSN — and for the self-signed certificate most
+on-prem instances use, `trustservercertificate=true` as well:
+
+```
+sqlserver://user:pass@host:1433?database=db&encrypt=true&trustservercertificate=true
+```
+
+Without the second flag, Node rejects the self-signed certificate. That is
+correct behaviour, and the error says so.
+
 ## Install
 
 Requires Node 20+.
@@ -233,8 +282,9 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;
 
 ## Limitations
 
-- Supports PostgreSQL, SQL Server, Oracle. (MySQL/SQLite would each need a new
-  adapter under `src/db/`.)
+- Supports PostgreSQL, SQL Server, Oracle (see [Supported database
+  versions](#supported-database-versions)). MySQL/SQLite would each need a new
+  adapter under `src/db/`.
 - DDL, `TRUNCATE`, `MERGE`, and stored procedures are deliberately denied.
 - `INSERT … ON CONFLICT DO UPDATE` classifies as create only (upsert semantics
   are a future scope call).
@@ -300,3 +350,23 @@ full-DSN path. Prerequisites: a `widgets(id int primary key, name text)` table
 and `read,create` but **not** delete — the harness asserts the delete, drop,
 unfiltered-delete and multi-statement steps are denied. It inserts `id = 99`, so
 delete that row between runs.
+
+### Checking other database versions
+
+The same harness is how the support matrix above was established. Each engine
+needs only a `widgets` table and an account with `read,create`:
+
+```sh
+# PostgreSQL — any tag
+docker run -d -p 5435:5432 -e POSTGRES_PASSWORD=smoke postgres:14
+
+# SQL Server — 2019 or 2022
+docker run -d -p 1435:1433 -e ACCEPT_EULA=Y \
+  -e MSSQL_SA_PASSWORD='Smoke!Passw0rd' mcr.microsoft.com/mssql/server:2019-latest
+
+# Oracle — XE images cover 18c/21c, oracle-free covers 23; service XEPDB1 / FREEPDB1
+docker run -d -p 1524:1521 -e ORACLE_PASSWORD=smoke gvenzl/oracle-xe:18-slim
+```
+
+Then point the harness at each in turn. A version that passes all twelve steps
+behaves identically to the ones in the table.
