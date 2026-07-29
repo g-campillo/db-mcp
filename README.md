@@ -84,8 +84,12 @@ npm link          # puts db-mcp on your PATH, so .mcp.json can just say "db-mcp"
 `npm link` symlinks this checkout, so after changing code you only need
 `npm run build` — the linked command picks it up.
 
+Then run `db-mcp` with no arguments to see every command, environment variable
+and DSN format on one screen.
+
 Other scripts: `npm test` (unit tests), `npm run typecheck`, `npm run dev`
-(run from source without building), `npm run smoke` (integration harness).
+(run from source without building — `npm run dev serve` to serve MCP from
+source), `npm run smoke` (integration harness).
 
 ## Configure
 
@@ -110,10 +114,10 @@ in the macOS Keychain and `DB_DSN_CMD` pulls it out.
 
 ## Managing credentials
 
-The built-in CLI stores connection strings in the macOS Keychain. `db-mcp` with
-**no arguments** is the MCP server; anything else is the CLI.
+The built-in CLI stores connection strings in the macOS Keychain.
 
 ```sh
+db-mcp                              # the overview: every command, env var and DSN format
 db-mcp keychain add                 # prompts, offers to test, stores db-mcp/<name>
 db-mcp keychain update              # pick an existing connection, re-enter creds
 db-mcp keychain list                # list stored connection names
@@ -121,7 +125,24 @@ db-mcp keychain rename old new      # fix a name you typed wrong
 db-mcp keychain test <name>         # connect using a stored connection
 db-mcp keychain delete <name>       # remove a stored connection
 db-mcp test                         # connect using the DB_* vars in the environment
+db-mcp serve                        # serve MCP over stdio by hand (see below)
 ```
+
+### Server mode vs the CLI
+
+One binary does both, and it decides by looking at **stdin**:
+
+| Invocation | What happens |
+|------------|--------------|
+| `db-mcp` launched by an MCP client (stdin is a pipe) | serves MCP over stdio |
+| `db-mcp` typed in a terminal (stdin is a TTY) | prints the overview screen |
+| `db-mcp <command>` | runs the CLI |
+| `db-mcp serve` | serves MCP over stdio regardless |
+
+So `.mcp.json` keeps working untouched — a spawned process never has a TTY —
+while typing `db-mcp` gets you the command list instead of a mute JSON-RPC
+stream. The same screen is available as `db-mcp --help`, and any single command
+explains itself with `db-mcp <command> --help`.
 
 `add` prompts for the database type, host, port, user, password, database (or
 Oracle SID) and a connection name, assembles the DSN, **offers to connect and
@@ -309,7 +330,7 @@ Two driver-level behaviours differ, both deliberate:
 
 ```
 src/
-  index.ts        entry — no argv serves MCP, argv runs the CLI
+  index.ts        entry — piped bare launch serves MCP, anything else is the CLI
   server.ts       serveStdio + McpServer
   tools.ts        the 5 MCP tools
   permissions.ts  SQL classifier and permission gate  ← security-critical
@@ -319,7 +340,7 @@ src/
   dsn.ts          build/parse the three DSN formats
   keychain.ts     macOS `security` shell-out
   db/             DbAdapter seam + postgres / mssql / oracle adapters
-  cli/            commander wiring, prompts, connection probe
+  cli/            commander wiring, overview screen, prompts, connection probe
 ```
 
 ## Test

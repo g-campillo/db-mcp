@@ -1,6 +1,7 @@
 import { errorMessage } from "../errors.js";
 import { Command } from "commander";
 import { VERSION } from "../version.js";
+import { epilogue, HELP_STYLES } from "./help.js";
 import {
   deleteStored,
   listStored,
@@ -13,26 +14,52 @@ import * as log from "./logger.js";
 import { closePrompts } from "./prompt.js";
 
 /**
- * The credential-management CLI. Only reached when db-mcp is invoked with
- * arguments — a bare invocation is the MCP server, whose stdout must stay
- * clean, so nothing in this module is imported in that path.
+ * The command-line side of db-mcp: credential management, connection tests and
+ * the overview screen. Reached whenever the process is not serving MCP, which
+ * an MCP client's bare piped launch never is — so nothing here is imported on
+ * the hot path where stdout carries JSON-RPC.
  */
 export async function runCli(argv: string[]): Promise<void> {
+  const program = buildProgram();
+  log.banner(VERSION);
+
+  // Commander treats "no command given" as a usage error: help on stderr,
+  // exit 1. Typing `db-mcp` to see what it does is not an error.
+  if (argv.length <= 2) {
+    program.outputHelp();
+    return;
+  }
+  await program.parseAsync(argv);
+}
+
+function buildProgram(): Command {
   const program = new Command();
 
   program
     .name("db-mcp")
     .description(
-      "MCP server for PostgreSQL, SQL Server and Oracle.\n" +
-        "Run with no arguments to serve MCP over stdio; the commands below manage credentials.",
+      "MCP server that runs SQL against PostgreSQL, SQL Server or Oracle —\n" +
+        "one process, one database, with per-project permission gating.",
     )
     .version(VERSION)
-    .showHelpAfterError();
+    .configureHelp(HELP_STYLES)
+    .showHelpAfterError("(run 'db-mcp' with no arguments for the full command list)")
+    .addHelpText("after", () => epilogue(program));
 
   program
     .command("test")
-    .description("Connect using the DB_* variables in the environment and report the result")
+    .description("Connect using the DB_* variables in the environment")
     .action(() => run(testEnvironment));
+
+  program
+    .command("serve")
+    .description("Serve MCP over stdio — what an MCP client runs")
+    .action(() =>
+      run(async () => {
+        const { runServer } = await import("../server.js");
+        await runServer();
+      }),
+    );
 
   const keychain = program
     .command("keychain")
@@ -55,7 +82,7 @@ export async function runCli(argv: string[]): Promise<void> {
 
   keychain
     .command("rename [old] [new]")
-    .description("Rename a stored connection, e.g. after typing the wrong name")
+    .description("Rename a stored connection, e.g. one you typed wrong")
     .action((oldName?: string, newName?: string) =>
       run(() => renameStored(oldName ?? "", newName ?? "")),
     );
@@ -70,8 +97,7 @@ export async function runCli(argv: string[]): Promise<void> {
     .description("Remove a stored connection")
     .action((name?: string) => run(() => deleteStored(name)));
 
-  log.banner(VERSION);
-  await program.parseAsync(argv);
+  return program;
 }
 
 /**

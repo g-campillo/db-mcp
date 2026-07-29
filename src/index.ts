@@ -1,16 +1,21 @@
 /**
  * Entry point.
  *
- * The MCP client launches db-mcp with **no arguments**; any invocation with
- * arguments is the credential-management CLI. The two paths are loaded
- * dynamically and never both: in server mode stdout carries the JSON-RPC
- * stream, so the CLI's logging and banner must not even be imported.
+ * An MCP client launches db-mcp with **no arguments** and a piped stdin, and
+ * that is the one invocation that serves MCP. Everything else is for a person:
+ * arguments run the CLI, and a bare invocation from a terminal — where stdin is
+ * a TTY, which a client's spawn never is — prints the overview rather than
+ * sitting mute on a JSON-RPC stream nobody is speaking. `db-mcp serve` forces
+ * server mode for the rare case of driving it by hand.
+ *
+ * The two paths are loaded dynamically and never both: in server mode stdout
+ * carries JSON-RPC, so the CLI's logging must not even be imported.
  */
 
 import { errorMessage } from "./errors.js";
 
 async function main(): Promise<void> {
-  if (process.argv.length <= 2) {
+  if (process.argv.length <= 2 && !process.stdin.isTTY) {
     const { runServer } = await import("./server.js");
     await runServer();
     return;

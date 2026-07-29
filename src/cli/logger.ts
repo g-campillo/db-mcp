@@ -26,8 +26,12 @@ export function plain(msg = ""): void {
   console.log(msg);
 }
 
+/**
+ * Written to stderr, not stdout: `db-mcp serve` reaches the CLI too, and there
+ * stdout is the JSON-RPC stream. A terminal shows both streams either way.
+ */
 export function banner(version: string): void {
-  console.log(`\n${INDENT}${chalk.bold.cyan(`db-mcp v${version}`)}\n`);
+  console.error(`\n${INDENT}${chalk.bold.cyan(`db-mcp v${version}`)}\n`);
 }
 
 /** A fenced block of config for the user to copy, e.g. an .mcp.json snippet. */
