@@ -3,7 +3,8 @@
 A single MCP server that runs SQL against **PostgreSQL, SQL Server, or Oracle**,
 where the CRUD operations the agent may perform are controlled per project.
 
-- One binary, three databases (pure-Go drivers — **no Oracle Instant Client, no ODBC**).
+- One command, three databases (pure-JavaScript drivers — **no Oracle Instant
+  Client, no ODBC**; node-oracledb runs in Thin mode).
 - **One process serves exactly one database**, defined entirely by the project's
   own `.mcp.json`. There is no way for the agent to reach any other database.
 - Permissions (`read` / `create` / `update` / `delete`, **read-only by default**),
@@ -21,20 +22,21 @@ parameter and no `list_connections` tool, so an agent is confined to the one
 database its project granted it. Store the secret in the macOS Keychain, not on
 disk.
 
-## Build
+## Install
 
-Requires Go 1.23+ (the toolchain auto-fetches a newer one if a dependency needs it).
+Requires Node 20+.
 
 ```sh
-make install       # build and put db-mcp on your PATH (/usr/local/bin; prompts
-                   # for sudo if needed). Then .mcp.json can just say "db-mcp".
+npm install
+npm run build
+npm link          # puts db-mcp on your PATH, so .mcp.json can just say "db-mcp"
 ```
 
-No-sudo alternative: `make install PREFIX=~/.local` (ensure `~/.local/bin` is on
-your PATH). `make` alone builds `./db-mcp` locally without installing.
+`npm link` symlinks this checkout, so after changing code you only need
+`npm run build` — the linked command picks it up.
 
-Other targets: `make test` (vet + unit tests), `make smoke` (builds the
-integration harness), `make clean`.
+Other scripts: `npm test` (unit tests), `npm run typecheck`, `npm run dev`
+(run from source without building), `npm run smoke` (integration harness).
 
 ## Configure
 
@@ -46,7 +48,7 @@ in the macOS Keychain and `DB_DSN_CMD` pulls it out.
 {
   "mcpServers": {
     "db": {
-      "command": "db-mcp",                     // on PATH after `make install`
+      "command": "db-mcp",                     // on PATH after `npm link`
       "env": {
         "DB_DRIVER": "oracle",                 // postgres | sqlserver | oracle
         "DB_PERMISSIONS": "read,create,update,delete",
@@ -57,22 +59,58 @@ in the macOS Keychain and `DB_DSN_CMD` pulls it out.
 }
 ```
 
-Store the connection in the Keychain with the built-in CLI — it prompts for the
-database type, host, port, user, password, database (or Oracle SID) and a
-connection name, assembles the DSN and saves it, then prints the exact
-`.mcp.json` snippet to paste:
+## Managing credentials
+
+The built-in CLI stores connection strings in the macOS Keychain. `db-mcp` with
+**no arguments** is the MCP server; anything else is the CLI.
 
 ```sh
-db-mcp keychain add                 # prompts, then stores db-mcp/<name>
+db-mcp keychain add                 # prompts, offers to test, stores db-mcp/<name>
 db-mcp keychain update              # pick an existing connection, re-enter creds
 db-mcp keychain list                # list stored connection names
+db-mcp keychain rename old new      # fix a name you typed wrong
+db-mcp keychain test <name>         # connect using a stored connection
+db-mcp keychain delete <name>       # remove a stored connection
+db-mcp test                         # connect using the DB_* vars in the environment
 ```
 
-`update` is how you rotate credentials later: pick the connection, type the new
-values, done — no `.mcp.json` change. The password prompt does not echo. Only
-the DSN is stored; the driver and permissions live in `.mcp.json`.
+`add` prompts for the database type, host, port, user, password, database (or
+Oracle SID) and a connection name, assembles the DSN, **offers to connect and
+verify it before storing**, and prints the exact `.mcp.json` snippet to paste.
+The password prompt does not echo. Only the DSN is stored; the driver and
+permissions live in `.mcp.json`.
 
-Equivalent manual command, if you prefer:
+`update` is how you rotate credentials later: pick the connection, type the new
+values, done — no `.mcp.json` change.
+
+### Testing a connection
+
+`db-mcp keychain test <name>` reads that entry's DSN, connects, and reports the
+server version and latency — or the driver's own error. The driver is inferred
+from the DSN's URL scheme, so there is nothing to specify. The secret is never
+printed; only `host:port/database` is shown.
+
+`db-mcp test` does the same for whatever `DB_*` variables are in the
+environment, which is how you debug a project's `.mcp.json` directly:
+
+```sh
+db-mcp test                                          # uses the ambient DB_* vars
+DB_DRIVER=postgres DB_DSN_CMD='...' db-mcp test      # or set them inline
+```
+
+Both exit non-zero on failure, so they work in a script.
+
+### Renaming a stored connection
+
+macOS `security` has no rename. `db-mcp keychain rename old new` copies the
+secret to the new service name, **verifies the copy reads back intact**, and
+only then deletes the original — so an interrupted rename never loses the
+credential. It refuses if the new name already exists, and prints the updated
+`DB_DSN_CMD` line to paste into `.mcp.json`.
+
+### Storing a DSN by hand
+
+If you prefer not to use the CLI:
 
 ```sh
 security add-generic-password -U -a navy-dev -s db-mcp/navy-dev -w 'oracle://user:pass@host:1521/service'
@@ -90,8 +128,13 @@ The `security` shell-out reads the item without a GUI prompt (the ACL is on the
 | oracle (service) | `oracle://user:pass@host:1521/service` |
 | oracle (SID) | `oracle://user:pass@host:1521/?SID=ORCL` |
 
-Verify the exact string with a quick connect test — driver DSN grammars differ
-(especially Oracle wallets/TNS, which are not supported: use host + port).
+These are the same strings the Go build wrote, so existing Keychain entries keep
+working untouched. Verify a new one with `db-mcp keychain test <name>`.
+
+SQL Server accepts extra options in the query string, e.g.
+`?database=db&encrypt=true&trustservercertificate=true`. Encryption defaults to
+off, matching the Go driver's default; the TDS login packet is encrypted either
+way.
 
 ### Environment variables
 
@@ -102,7 +145,7 @@ Verify the exact string with a quick connect test — driver DSN grammars differ
 | `DB_DSN` | full DSN inline (prefer `DB_DSN_CMD`) | — |
 | `DB_PERMISSIONS` | comma list of `read,create,update,delete` | `read` |
 | `DB_MAX_ROWS` | max rows returned per query | `500` |
-| `DB_QUERY_TIMEOUT` | per-query timeout (Go duration) | `30s` |
+| `DB_QUERY_TIMEOUT` | per-query timeout (Go-style duration, e.g. `30s`, `1m30s`) | `30s` |
 | `DB_ALLOW_UNFILTERED_WRITES` | allow `UPDATE`/`DELETE` with no top-level `WHERE` | `false` |
 | `DB_AUDIT_PATH` | audit log path | `<UserConfigDir>/db-mcp/audit.jsonl` |
 | `DB_AUDIT_DISABLED` | set true to disable auditing | `false` |
@@ -138,6 +181,11 @@ parameter.
   Oracle needs `PLAN_TABLE` available to the user.
 
 The introspection tools require `read` permission.
+
+`DB_MAX_ROWS` bounds what is **fetched**, not merely what is returned: reads
+stream through a server-side cursor (Postgres), a cancellable row stream (SQL
+Server) or the driver's own `maxRows` (Oracle), so `SELECT *` against a large
+table stays cheap.
 
 ## Audit log
 
@@ -185,8 +233,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;
 
 ## Limitations
 
-- Supports PostgreSQL, SQL Server, Oracle. (MySQL/SQLite are easy to add — both are
-  `database/sql` drivers.)
+- Supports PostgreSQL, SQL Server, Oracle. (MySQL/SQLite would each need a new
+  adapter under `src/db/`.)
 - DDL, `TRUNCATE`, `MERGE`, and stored procedures are deliberately denied.
 - `INSERT … ON CONFLICT DO UPDATE` classifies as create only (upsert semantics
   are a future scope call).
@@ -194,25 +242,61 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_ro;
 - Oracle connects by host+port with service name or SID (no wallets / TNS aliases
   yet); `list_tables` excludes materialized views.
 - The audit log has no built-in rotation and is not fsync'd per line.
+- The keychain CLI is macOS-only (it shells out to `security`); the MCP server
+  itself runs anywhere Node does.
+
+### Differences from the Go build
+
+Two driver-level behaviours differ, both deliberate:
+
+- **Postgres `bigint`/`numeric` arrive as strings.** `pg` returns them that way,
+  where Go's pgx returned integers. Keeping the string avoids silent precision
+  loss when a value exceeds `Number.MAX_SAFE_INTEGER` during JSON serialisation.
+- **Timestamps render in UTC** (`2026-07-29T12:34:56.000Z`) rather than with a
+  local offset. Same instant, different spelling.
+
+## Layout
+
+```
+src/
+  index.ts        entry — no argv serves MCP, argv runs the CLI
+  server.ts       serveStdio + McpServer
+  tools.ts        the 5 MCP tools
+  permissions.ts  SQL classifier and permission gate  ← security-critical
+  config.ts       DB_* env -> ResolvedConfig
+  connection.ts   lazy handle, DSN resolution
+  audit.ts        JSONL auditor
+  dsn.ts          build/parse the three DSN formats
+  keychain.ts     macOS `security` shell-out
+  db/             DbAdapter seam + postgres / mssql / oracle adapters
+  cli/            commander wiring, prompts, connection probe
+```
 
 ## Test
 
 ```sh
-go test ./...   # classifier (security-critical core), config parsing, cell caps
+npm test        # classifier (security-critical core), config parsing, DSN
+                # round-trips, cell caps, keychain parsing, error formatting
 ```
 
 ### Smoke harness
 
-`cmd/smoke` launches the built binary over stdio as a real MCP client and
+`src/smoke.ts` launches the built command over stdio as a real MCP client and
 exercises every tool against a live database:
 
 ```sh
-go build -o db-mcp . && go build -o smoke ./cmd/smoke
-env DB_DRIVER=postgres DB_HOST=localhost DB_PORT=5433 DB_USER=postgres \
-    DB_PASSWORD=smoke DB_NAME=postgres DB_PERMISSIONS=read,create ./smoke ./db-mcp
+docker run -d --name db-mcp-smoke -p 5434:5432 -e POSTGRES_PASSWORD=smoke postgres:16
+docker exec db-mcp-smoke psql -U postgres -c \
+  "CREATE TABLE widgets (id int primary key, name text);"
+
+npm run build
+env DB_DRIVER=postgres DB_HOST=localhost DB_PORT=5434 DB_USER=postgres \
+    DB_PASSWORD=smoke DB_NAME=postgres DB_PERMISSIONS=read,create \
+    npm run smoke
 ```
 
 Set `DB_DSN` (or `DB_DSN_CMD`) instead of the discrete fields to exercise the
 full-DSN path. Prerequisites: a `widgets(id int primary key, name text)` table
-and `read,create` but **not** delete — the harness asserts the
-delete/drop/unfiltered-delete steps are denied.
+and `read,create` but **not** delete — the harness asserts the delete, drop,
+unfiltered-delete and multi-statement steps are denied. It inserts `id = 99`, so
+delete that row between runs.

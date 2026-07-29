@@ -1,0 +1,45 @@
+{
+  "name": "db-mcp",
+  "version": "0.4.0",
+  "description": "MCP server that runs SQL against PostgreSQL, SQL Server or Oracle with per-project permission gating",
+  "type": "module",
+  "bin": {
+    "db-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx src/smoke.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "chalk": "^6.0.0",
+    "commander": "^15.0.0",
+    "mssql": "^12.7.0",
+    "oracledb": "^7.0.1",
+    "pg": "^8.22.0",
+    "pg-cursor": "^2.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@types/mssql": "^9.1.7",
+    "@types/node": "^25.3.5",
+    "@types/oracledb": "^7.0.1",
+    "@types/pg": "^8.15.6",
+    "@types/pg-cursor": "^2.7.2",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
