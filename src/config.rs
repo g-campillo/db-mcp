@@ -4,12 +4,15 @@
 //! There is no machine-global config file: a project reaches exactly the
 //! database its own .mcp.json names, and nothing else.
 
+use std::io::Write as _;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 
 use crate::drivers::{SqlDriver, resolve_driver};
 use crate::duration::parse_go_duration;
+use crate::paths::app_config_dir;
 use crate::permissions::{PermSet, parse_perms};
 
 /// The resolved connection config.
@@ -52,7 +55,7 @@ pub struct ResolvedConfig {
 /// fixed map, so the ambient environment cannot leak in.
 pub fn load_config(env: impl Fn(&str) -> Option<String>) -> Result<ResolvedConfig> {
     let raw = |k: &str| env(k).unwrap_or_default();
-    let trimmed = |k: &str| raw(k).trim().to_owned();
+    let trimmed = |k: &str| js_trim(&raw(k)).to_owned();
 
     let driver = trimmed("DB_DRIVER");
     if driver.is_empty() {
@@ -192,6 +195,33 @@ pub fn load_config_from_env() -> Result<ResolvedConfig> {
     load_config(|k| std::env::var(k).ok())
 }
 
+/// Nags once on stderr if the retired machine-global config file is still on
+/// disk. It is no longer read: that ambient file let any project reach every
+/// connection listed in it. Credentials now live per-project in .mcp.json env
+/// plus the macOS Keychain.
+pub fn warn_stale_global_config() {
+    // No config directory means there can be no stale file in it either.
+    let Ok(dir) = app_config_dir() else {
+        return;
+    };
+    if let Some(warning) = stale_global_config_warning(&dir) {
+        // A warning that cannot be written must not stop the server, and
+        // eprint! would panic on a closed stderr.
+        let _ = std::io::stderr().write_all(warning.as_bytes());
+    }
+}
+
+/// The warning line, newline included, when `<app_dir>/config.json` exists.
+fn stale_global_config_warning(app_dir: &Path) -> Option<String> {
+    let path = app_dir.join("config.json");
+    path.exists().then(|| {
+        format!(
+            "db-mcp: warning: {} is no longer read; move each project's connection into its .mcp.json env (DB_DRIVER + DB_PERMISSIONS + DB_DSN_CMD) and delete this file\n",
+            path.display()
+        )
+    })
+}
+
 /// Go's strconv.ParseBool accepts these spellings and nothing else.
 pub(crate) fn parse_go_bool(s: &str) -> Option<bool> {
     match s {
@@ -199,6 +229,14 @@ pub(crate) fn parse_go_bool(s: &str) -> Option<bool> {
         "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
         _ => None,
     }
+}
+
+/// Trims what JavaScript's String.prototype.trim trims, so values are cut
+/// exactly as the TypeScript build cut them. That set is Unicode White_Space
+/// (what `str::trim` uses) minus U+0085 NEXT LINE, plus U+FEFF, the byte
+/// order mark.
+pub(crate) fn js_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}')
 }
 
 #[cfg(test)]
@@ -456,5 +494,80 @@ mod tests {
                 "{label}: {message:?} lacks {want:?}"
             );
         }
+    }
+
+    /// The code points Node's trim() strips, found by running every code point
+    /// through it.
+    fn trimmed_by_javascript(c: char) -> bool {
+        matches!(
+            u32::from(c),
+            0x9..=0xd
+                | 0x20
+                | 0xa0
+                | 0x1680
+                | 0x2000..=0x200a
+                | 0x2028
+                | 0x2029
+                | 0x202f
+                | 0x205f
+                | 0x3000
+                | 0xfeff
+        )
+    }
+
+    #[test]
+    fn js_trim_strips_exactly_what_javascript_strips() {
+        let mut buf = [0u8; 4];
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            assert_eq!(
+                js_trim(c.encode_utf8(&mut buf)).is_empty(),
+                trimmed_by_javascript(c),
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+        assert_eq!(js_trim(" \u{85}x\u{feff} "), "\u{85}x");
+    }
+
+    #[test]
+    fn trims_values_as_javascript_does() {
+        let c = load(&[
+            ("DB_DRIVER", "\u{feff}postgres "),
+            ("DB_HOST", "\u{feff}h\u{85}"),
+            ("DB_USER", "u"),
+            ("DB_NAME", "d"),
+        ])
+        .unwrap();
+        assert_eq!(c.driver, "postgres");
+        assert_eq!(c.host, "h\u{85}");
+    }
+
+    #[test]
+    fn no_warning_without_a_config_json() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stale_global_config_warning(dir.path()), None);
+    }
+
+    #[test]
+    fn warns_when_the_retired_config_json_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            stale_global_config_warning(dir.path()).unwrap(),
+            format!(
+                "db-mcp: warning: {} is no longer read; move each project's connection into its .mcp.json env (DB_DRIVER + DB_PERMISSIONS + DB_DSN_CMD) and delete this file\n",
+                path.display()
+            )
+        );
+    }
+
+    /// Node's existsSync follows symbolic links, so a dangling one is absent.
+    #[cfg(unix)]
+    #[test]
+    fn no_warning_for_a_dangling_config_json_link() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("missing.json", dir.path().join("config.json")).unwrap();
+        assert_eq!(stale_global_config_warning(dir.path()), None);
     }
 }

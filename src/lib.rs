@@ -4,8 +4,11 @@
 //! The library holds all of the logic; the `db-mcp` binary (src/main.rs, added
 //! with the CLI) is a thin entry point on top of it.
 
+pub mod audit;
 pub mod config;
 pub mod drivers;
 pub mod dsn;
 pub mod duration;
+pub mod keychain;
+pub mod paths;
 pub mod permissions;
