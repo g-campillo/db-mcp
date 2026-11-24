@@ -5,3 +5,5 @@ dist/
 .mcp.json
 .DS_Store
 .idea/
+
+/target

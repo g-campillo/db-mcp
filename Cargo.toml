@@ -1,0 +1,13 @@
+[package]
+name = "db-mcp"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.89"
+description = "MCP server that runs SQL against PostgreSQL, SQL Server or Oracle with per-project permissions gating"
+license = "ISC"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+percent-encoding = "2.3.2"
+url = "2.5.8"
